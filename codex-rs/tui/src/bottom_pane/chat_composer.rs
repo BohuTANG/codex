@@ -55,7 +55,10 @@ const LARGE_PASTE_CHAR_THRESHOLD: usize = 1000;
 #[derive(Debug, PartialEq)]
 pub enum InputResult {
     Submitted(String),
-    Command(SlashCommand),
+    Command {
+        command: SlashCommand,
+        raw_input: String,
+    },
     None,
 }
 
@@ -416,6 +419,16 @@ impl ChatComposer {
                 ..
             } => {
                 if let Some(sel) = popup.selected_item() {
+                    // Capture the current text before clearing the composer so we can
+                    // forward the raw command invocation to the caller.
+                    let raw_first_line = self
+                        .textarea
+                        .text()
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
+
                     // Clear textarea so no residual text remains.
                     self.textarea.set_text("");
                     // Capture any needed data from popup before clearing it.
@@ -430,7 +443,13 @@ impl ChatComposer {
 
                     match sel {
                         CommandItem::Builtin(cmd) => {
-                            return (InputResult::Command(cmd), true);
+                            return (
+                                InputResult::Command {
+                                    command: cmd,
+                                    raw_input: raw_first_line,
+                                },
+                                true,
+                            );
                         }
                         CommandItem::UserPrompt(_) => {
                             if let Some(contents) = prompt_content {
@@ -1857,8 +1876,9 @@ mod tests {
         // When a slash command is dispatched, the composer should return a
         // Command result (not submit literal text) and clear its textarea.
         match result {
-            InputResult::Command(cmd) => {
-                assert_eq!(cmd.command(), "init");
+            InputResult::Command { command, raw_input } => {
+                assert_eq!(command.command(), "init");
+                assert_eq!(raw_input, "/init");
             }
             InputResult::Submitted(text) => {
                 panic!("expected command dispatch, but composer submitted literal text: {text}")
@@ -1915,8 +1935,9 @@ mod tests {
             composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
         match result {
-            InputResult::Command(cmd) => {
-                assert_eq!(cmd.command(), "mention");
+            InputResult::Command { command, raw_input } => {
+                assert_eq!(command.command(), "mention");
+                assert_eq!(raw_input, "/mention");
             }
             InputResult::Submitted(text) => {
                 panic!("expected command dispatch, but composer submitted literal text: {text}")
