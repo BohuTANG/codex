@@ -229,6 +229,136 @@ fn entered_review_mode_defaults_to_current_changes_banner() {
     assert!(chat.is_review_mode);
 }
 
+#[test]
+fn entered_review_mode_includes_github_pr_details_in_banner() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual();
+    let review_request =
+        ChatWidget::review_request_for_github_pr("https://github.com/openai/codex/pull/123")
+            .expect("pr review request");
+
+    chat.handle_codex_event(Event {
+        id: "review-start".into(),
+        msg: EventMsg::EnteredReviewMode(review_request),
+    });
+
+    let cells = drain_insert_history(&mut rx);
+    let banner = lines_to_single_string(cells.last().expect("review banner"));
+    assert_eq!(
+        banner,
+        ">> Code review started: GitHub PR openai/codex#123 (https://github.com/openai/codex/pull/123) <<\n",
+    );
+    assert!(chat.is_review_mode);
+}
+
+#[test]
+fn entered_review_mode_derives_github_info_when_hint_generic() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual();
+    let mut review_request =
+        ChatWidget::review_request_for_github_pr("https://github.com/openai/codex/pull/234")
+            .expect("pr review request");
+    review_request.user_facing_hint = "current changes".to_string();
+
+    chat.handle_codex_event(Event {
+        id: "review-start".into(),
+        msg: EventMsg::EnteredReviewMode(review_request),
+    });
+
+    let cells = drain_insert_history(&mut rx);
+    let banner = lines_to_single_string(cells.last().expect("review banner"));
+    assert_eq!(
+        banner,
+        ">> Code review started: GitHub PR openai/codex#234 (https://github.com/openai/codex/pull/234) <<\n",
+    );
+    assert!(chat.is_review_mode);
+}
+
+#[test]
+fn inline_review_command_for_pr_submits_review_op() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual();
+
+    chat.submit_user_message(UserMessage::from(
+        "/review https://github.com/openai/codex/pull/123".to_string(),
+    ));
+
+    let op = op_rx.try_recv().expect("expected review op");
+    let Op::Review { review_request } = op else {
+        panic!("expected review op");
+    };
+    assert_eq!(review_request.user_facing_hint, "openai/codex#123");
+    assert!(
+        review_request
+            .prompt
+            .contains("https://github.com/openai/codex/pull/123")
+    );
+    assert!(review_request.prompt.contains("gh pr view"));
+    assert!(
+        review_request
+            .prompt
+            .contains("git fetch origin pull/123/head:codex/pr/123")
+    );
+
+    // Inline slash command should not push a visible user history entry.
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn slash_review_command_with_url_uses_pr_banner() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual();
+
+    chat.dispatch_command(
+        SlashCommand::Review,
+        Some("/review https://github.com/openai/codex/pull/987".to_string()),
+    );
+
+    let op = op_rx.try_recv().expect("expected review op");
+    let Op::Review { review_request } = op else {
+        panic!("expected review op");
+    };
+    assert_eq!(review_request.user_facing_hint, "openai/codex#987");
+    assert!(
+        review_request
+            .prompt
+            .contains("https://github.com/openai/codex/pull/987")
+    );
+}
+
+#[test]
+fn inline_review_command_without_args_defaults() {
+    let (mut chat, mut _rx, mut op_rx) = make_chatwidget_manual();
+
+    chat.submit_user_message(UserMessage::from("/review".to_string()));
+
+    let op = op_rx.try_recv().expect("expected review op");
+    let Op::Review { review_request } = op else {
+        panic!("expected review op");
+    };
+    assert_eq!(review_request.user_facing_hint, "current changes");
+    assert_eq!(review_request.prompt, "review current changes");
+}
+
+#[test]
+fn inline_review_command_with_extra_words_falls_back() {
+    let (mut chat, mut _rx, mut op_rx) = make_chatwidget_manual();
+
+    chat.submit_user_message(UserMessage::from(
+        "/review please check my changes".to_string(),
+    ));
+
+    let op = op_rx.try_recv().expect("expected user input op");
+    match op {
+        Op::UserInput { items } => {
+            assert_eq!(items.len(), 1);
+            match &items[0] {
+                InputItem::Text { text } => {
+                    assert_eq!(text, "/review please check my changes");
+                }
+                _ => panic!("expected text input"),
+            }
+        }
+        other => panic!("unexpected op: {other:?}"),
+    }
+}
+
 /// Completing review with findings shows the selection popup and finishes with
 /// the closing banner while clearing review mode state.
 #[test]
@@ -711,7 +841,7 @@ fn disabled_slash_command_while_task_running_snapshot() {
     chat.bottom_pane.set_task_running(true);
 
     // Dispatch a command that is unavailable while a task runs (e.g., /model)
-    chat.dispatch_command(SlashCommand::Model);
+    chat.dispatch_command(SlashCommand::Model, None);
 
     // Drain history and snapshot the rendered error line(s)
     let cells = drain_insert_history(&mut rx);

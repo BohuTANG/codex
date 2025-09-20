@@ -53,6 +53,7 @@ use ratatui::widgets::Widget;
 use ratatui::widgets::WidgetRef;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::debug;
+use url::Url;
 
 use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
@@ -836,8 +837,8 @@ impl ChatWidget {
                             self.submit_user_message(user_message);
                         }
                     }
-                    InputResult::Command(cmd) => {
-                        self.dispatch_command(cmd);
+                    InputResult::Command { command, raw_input } => {
+                        self.dispatch_command(command, Some(raw_input));
                     }
                     InputResult::None => {}
                 }
@@ -860,7 +861,7 @@ impl ChatWidget {
         self.request_redraw();
     }
 
-    fn dispatch_command(&mut self, cmd: SlashCommand) {
+    fn dispatch_command(&mut self, cmd: SlashCommand, raw_input: Option<String>) {
         if !cmd.available_during_task() && self.bottom_pane.is_task_running() {
             let message = format!(
                 "'/{}' is disabled while a task is in progress.",
@@ -883,13 +884,11 @@ impl ChatWidget {
                 self.app_event_tx.send(AppEvent::CodexOp(Op::Compact));
             }
             SlashCommand::Review => {
-                // Simplified flow: directly send a review op for current changes.
-                self.submit_op(Op::Review {
-                    review_request: ReviewRequest {
-                        prompt: "review current changes".to_string(),
-                        user_facing_hint: "current changes".to_string(),
-                    },
-                });
+                let review_request = raw_input
+                    .as_ref()
+                    .and_then(|text| Self::review_request_from_inline_command(text))
+                    .unwrap_or_else(Self::review_request_for_current_changes);
+                self.submit_op(Op::Review { review_request });
             }
             SlashCommand::Model => {
                 self.open_model_popup();
@@ -1016,6 +1015,14 @@ impl ChatWidget {
 
     fn submit_user_message(&mut self, user_message: UserMessage) {
         let UserMessage { text, image_paths } = user_message;
+
+        if image_paths.is_empty() {
+            if let Some(review_request) = Self::review_request_from_inline_command(&text) {
+                self.submit_op(Op::Review { review_request });
+                return;
+            }
+        }
+
         let mut items: Vec<InputItem> = Vec::new();
 
         if !text.is_empty() {
@@ -1164,9 +1171,69 @@ impl ChatWidget {
     fn on_entered_review_mode(&mut self, review: ReviewRequest) {
         // Enter review mode and emit a concise banner
         self.is_review_mode = true;
-        let banner = format!(">> Code review started: {} <<", review.user_facing_hint);
+        let banner = Self::review_banner(&review);
         self.add_to_history(history_cell::new_review_status_line(banner));
         self.request_redraw();
+    }
+
+    fn review_banner(review: &ReviewRequest) -> String {
+        if let Some((slug, pr_url)) = Self::github_pr_details(review) {
+            return format!(">> Code review started: GitHub PR {slug} ({pr_url}) <<");
+        }
+        format!(">> Code review started: {} <<", review.user_facing_hint)
+    }
+
+    fn github_pr_details(review: &ReviewRequest) -> Option<(String, String)> {
+        Self::github_pr_details_from_hint(&review.user_facing_hint)
+            .or_else(|| Self::github_pr_details_from_prompt(&review.prompt))
+    }
+
+    fn github_pr_details_from_hint(hint: &str) -> Option<(String, String)> {
+        let (owner_repo, pr_segment) = hint.split_once('#')?;
+        let (owner, repo) = owner_repo.split_once('/')?;
+        let pr_number: u64 = pr_segment.trim().parse().ok()?;
+        let owner = owner.trim();
+        let repo = repo.trim();
+        if owner.is_empty() || repo.is_empty() {
+            return None;
+        }
+        let slug = format!("{owner}/{repo}#{pr_number}");
+        let url = format!("https://github.com/{owner}/{repo}/pull/{pr_number}");
+        Some((slug, url))
+    }
+
+    fn github_pr_details_from_prompt(prompt: &str) -> Option<(String, String)> {
+        let url = Self::github_pr_url_from_prompt(prompt)?;
+        let (owner, repo, pr_number) = Self::parse_github_pr_components(&url)?;
+        let slug = format!("{owner}/{repo}#{pr_number}");
+        let normalized_url = format!("https://github.com/{owner}/{repo}/pull/{pr_number}");
+        Some((slug, normalized_url))
+    }
+
+    fn github_pr_url_from_prompt(prompt: &str) -> Option<Url> {
+        let prefix = "Review GitHub pull request ";
+        let rest = prompt.strip_prefix(prefix)?;
+        let end = rest.find(". ")?;
+        let candidate = &rest[..end];
+        let url = Url::parse(candidate).ok()?;
+        let host = url.host_str()?.to_ascii_lowercase();
+        if host != "github.com" && host != "www.github.com" {
+            return None;
+        }
+        Some(url)
+    }
+
+    fn parse_github_pr_components(url: &Url) -> Option<(String, String, u64)> {
+        let mut segments = url.path_segments()?.filter(|segment| !segment.is_empty());
+        let owner = segments.next()?.to_string();
+        let repo = segments.next()?.to_string();
+        let pull_keyword = segments.next()?;
+        if pull_keyword != "pull" {
+            return None;
+        }
+        let pr_segment = segments.next()?;
+        let pr_number: u64 = pr_segment.parse().ok()?;
+        Some((owner, repo, pr_number))
     }
 
     fn on_exited_review_mode(&mut self, review: ExitedReviewModeEvent) {
@@ -1517,6 +1584,67 @@ impl ChatWidget {
             .as_ref()
             .map(|ti| ti.total_token_usage.clone())
             .unwrap_or_default()
+    }
+
+    fn review_request_from_inline_command(text: &str) -> Option<ReviewRequest> {
+        let trimmed = text.trim();
+        let Some(rest) = trimmed.strip_prefix("/review") else {
+            return None;
+        };
+        let rest = rest.trim();
+        if rest.is_empty() {
+            return Some(Self::review_request_for_current_changes());
+        }
+        // Only treat single-argument variants as commands; fall back to normal message otherwise.
+        if rest.split_whitespace().nth(1).is_some() {
+            return None;
+        }
+        Self::review_request_for_github_pr(rest)
+    }
+
+    fn review_request_for_current_changes() -> ReviewRequest {
+        ReviewRequest {
+            prompt: "review current changes".to_string(),
+            user_facing_hint: "current changes".to_string(),
+        }
+    }
+
+    fn review_request_for_github_pr(candidate: &str) -> Option<ReviewRequest> {
+        let url = Url::parse(candidate).ok()?;
+        let host = url.host_str()?.to_ascii_lowercase();
+        if host != "github.com" && host != "www.github.com" {
+            return None;
+        }
+        let mut segments = url.path_segments()?.filter(|segment| !segment.is_empty());
+        let owner = segments.next()?.to_string();
+        let repo = segments.next()?.to_string();
+        let pull_keyword = segments.next()?;
+        if pull_keyword != "pull" {
+            return None;
+        }
+        let pr_segment = segments.next()?;
+        let pr_number: u64 = pr_segment.parse().ok()?;
+
+        let normalized_url = format!("https://github.com/{owner}/{repo}/pull/{pr_number}");
+        let branch_name = format!("codex/pr/{pr_number}");
+        let prompt = format!(
+            concat!(
+                "Review GitHub pull request {url}. ",
+                "Use available tools to inspect the change:\n",
+                "- `gh pr view {url} --patch` to retrieve metadata and diff (when `gh` is installed).\n",
+                "- Or `git fetch origin pull/{pr}/head:{branch}` followed by `git diff HEAD {branch}` to compare locally.\n",
+                "If network access is blocked, ask the user for the diff.",
+            ),
+            url = normalized_url,
+            pr = pr_number,
+            branch = branch_name,
+        );
+        let user_facing_hint = format!("{owner}/{repo}#{pr_number}");
+
+        Some(ReviewRequest {
+            prompt,
+            user_facing_hint,
+        })
     }
 
     pub(crate) fn conversation_id(&self) -> Option<ConversationId> {
